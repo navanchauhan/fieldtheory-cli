@@ -457,11 +457,11 @@ export async function syncBookmarksGraphQL(
       stopReason = 'target additions reached';
       break;
     }
-    if (incremental && reachedLatestStored) {
+    if (reachedLatestStored) {
       stopReason = 'caught up to newest stored bookmark';
       break;
     }
-    if (incremental && stalePages >= stalePageLimit) {
+    if (stalePages >= stalePageLimit) {
       stopReason = 'no new bookmarks (stale)';
       break;
     }
