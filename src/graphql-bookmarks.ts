@@ -648,25 +648,59 @@ export async function syncGaps(options?: {
   const maybeTruncated = records.filter((r) => (r.text?.length ?? 0) >= TRUNCATION_THRESHOLD);
   const truncatedIds = new Set(maybeTruncated.map((r) => r.tweetId));
 
+  // Build lookup indexes for applying results
+  const recordsByQuotedId = new Map<string, BookmarkRecord[]>();
+  for (const r of needsQuotedTweet) {
+    const list = recordsByQuotedId.get(r.quotedStatusId!) ?? [];
+    list.push(r);
+    recordsByQuotedId.set(r.quotedStatusId!, list);
+  }
+  const recordsByTweetId = new Map<string, BookmarkRecord[]>();
+  for (const r of maybeTruncated) {
+    const list = recordsByTweetId.get(r.tweetId) ?? [];
+    list.push(r);
+    recordsByTweetId.set(r.tweetId, list);
+  }
+
   // Combine all IDs to fetch — deduplicated
   const allFetchIds = [...new Set([...quotedIds, ...truncatedIds])];
   const total = allFetchIds.length;
 
-  const fetched = new Map<string, QuotedTweetSnapshot | null>();
   let quotedFetched = 0;
   let textExpanded = 0;
   let failed = 0;
+  const dbQuotedUpdates: Array<{ id: string; quotedTweet: QuotedTweetSnapshot }> = [];
+  const dbTextUpdates: Array<{ id: string; text: string }> = [];
 
-  // Fetch all needed tweets in one pass
+  // Fetch and apply incrementally
   for (let i = 0; i < allFetchIds.length; i++) {
     const tweetId = allFetchIds[i];
+    let snapshot: QuotedTweetSnapshot | null = null;
     try {
-      const snapshot = await fetchTweetViaSyndication(tweetId);
-      fetched.set(tweetId, snapshot);
+      snapshot = await fetchTweetViaSyndication(tweetId);
       if (!snapshot) failed++;
     } catch {
-      fetched.set(tweetId, null);
       failed++;
+    }
+
+    // Apply immediately so progress is accurate
+    if (snapshot) {
+      // Quoted tweet gap
+      for (const record of recordsByQuotedId.get(tweetId) ?? []) {
+        if (!record.quotedTweet) {
+          record.quotedTweet = snapshot;
+          dbQuotedUpdates.push({ id: record.id, quotedTweet: snapshot });
+          quotedFetched++;
+        }
+      }
+      // Truncated text gap
+      for (const record of recordsByTweetId.get(tweetId) ?? []) {
+        if (snapshot.text.length > (record.text?.length ?? 0)) {
+          record.text = snapshot.text;
+          dbTextUpdates.push({ id: record.id, text: snapshot.text });
+          textExpanded++;
+        }
+      }
     }
 
     options?.onProgress?.({
@@ -677,41 +711,20 @@ export async function syncGaps(options?: {
       failed,
     });
 
+    // Checkpoint every 100 fetches
+    if ((i + 1) % 100 === 0) {
+      await writeJsonLines(cachePath, records);
+    }
+
     if (i < allFetchIds.length - 1) {
       await new Promise((r) => setTimeout(r, delayMs));
-    }
-  }
-
-  // Apply results
-  const dbQuotedUpdates: Array<{ id: string; quotedTweet: QuotedTweetSnapshot }> = [];
-  const dbTextUpdates: Array<{ id: string; text: string }> = [];
-
-  for (const record of records) {
-    // Apply quoted tweet snapshots
-    if (record.quotedStatusId && !record.quotedTweet) {
-      const snapshot = fetched.get(record.quotedStatusId);
-      if (snapshot) {
-        record.quotedTweet = snapshot;
-        dbQuotedUpdates.push({ id: record.id, quotedTweet: snapshot });
-        quotedFetched++;
-      }
-    }
-
-    // Apply expanded text (only if syndication returned longer text)
-    if ((record.text?.length ?? 0) >= TRUNCATION_THRESHOLD) {
-      const snapshot = fetched.get(record.tweetId);
-      if (snapshot && snapshot.text.length > (record.text?.length ?? 0)) {
-        record.text = snapshot.text;
-        dbTextUpdates.push({ id: record.id, text: snapshot.text });
-        textExpanded++;
-      }
     }
   }
 
   // Find bookmarks missing bookmarkedAt (filled on next sync, not via syndication)
   const bookmarkedAtMissing = records.filter((r) => !r.bookmarkedAt).length;
 
-  // Persist
+  // Final persist
   await writeJsonLines(cachePath, records);
   if (dbQuotedUpdates.length > 0) await updateQuotedTweets(dbQuotedUpdates);
   if (dbTextUpdates.length > 0) await updateBookmarkText(dbTextUpdates);
