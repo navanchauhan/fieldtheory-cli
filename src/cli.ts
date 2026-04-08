@@ -5,6 +5,20 @@ import { getBookmarkStatusView, formatBookmarkStatus } from './bookmarks-service
 import { runTwitterOAuthFlow } from './xauth.js';
 import { syncBookmarksGraphQL, syncGaps } from './graphql-bookmarks.js';
 import type { SyncProgress, GapFillProgress } from './graphql-bookmarks.js';
+import { syncInstagramSaved } from './instagram-api.js';
+import type { InstagramSyncProgress } from './instagram-api.js';
+import {
+  buildInstagramIndex,
+  searchInstagramPosts,
+  formatInstagramSearchResults,
+  listInstagramPosts,
+  getInstagramPostById,
+  getInstagramStats,
+} from './instagram-db.js';
+import { downloadInstagramMedia } from './instagram-media.js';
+import { readJsonLines } from './fs.js';
+import { instagramCachePath, instagramIndexPath } from './paths.js';
+import type { InstagramSavedPost } from './instagram-types.js';
 import { fetchBookmarkMediaBatch } from './bookmark-media.js';
 import {
   buildIndex,
@@ -1144,6 +1158,327 @@ export function buildCli() {
       for (const r of results) {
         console.log(`  Removed from ${r.agent}: ${r.path}`);
       }
+    }));
+
+  // ── Instagram ─────────────────────────────────────────────────────────
+
+  const ig = program
+    .command('ig')
+    .description('Instagram saved posts — sync, search, list, download');
+
+  function requireIgData(): boolean {
+    if (!fs.existsSync(instagramCachePath())) {
+      console.log(`
+  No Instagram saved posts synced yet.
+
+  Get started:
+
+    1. Open your browser and log into instagram.com
+    2. Run: ft ig sync
+`);
+      process.exitCode = 1;
+      return false;
+    }
+    return true;
+  }
+
+  function requireIgIndex(): boolean {
+    if (!requireIgData()) return false;
+    if (!fs.existsSync(instagramIndexPath())) {
+      console.log(`
+  Instagram search index not built yet.
+
+  Run: ft ig index
+`);
+      process.exitCode = 1;
+      return false;
+    }
+    return true;
+  }
+
+  async function rebuildIgIndex(added: number): Promise<number> {
+    if (added <= 0) return 0;
+    process.stderr.write('  Building Instagram search index...\n');
+    const idx = await buildInstagramIndex();
+    process.stderr.write(`  \u2713 ${idx.recordCount} posts indexed (${idx.newRecords} new)\n`);
+    return idx.newRecords;
+  }
+
+  // ── ig sync ──
+
+  ig
+    .command('sync')
+    .description('Sync saved posts from Instagram')
+    .option('--rebuild', 'Full re-crawl of all saved posts', false)
+    .option('--max-pages <n>', 'Max pages to fetch', (v: string) => Number(v), 200)
+    .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 800)
+    .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
+    .option('--browser <name>', 'Browser to read session from')
+    .option('--cookies <values...>', 'Pass sessionid, csrftoken, ds_user_id directly')
+    .option('--chrome-user-data-dir <path>', 'Chrome-family user-data directory')
+    .option('--chrome-profile-directory <name>', 'Chrome-family profile name')
+    .option('--download-media', 'Download media (images, videos, audio) after sync', false)
+    .action(safe(async (options) => {
+      ensureDataDir();
+
+      let sessionId: string | undefined;
+      let csrfToken: string | undefined;
+      let dsUserId: string | undefined;
+      let cookieHeader: string | undefined;
+
+      if (options.cookies && Array.isArray(options.cookies) && options.cookies.length >= 2) {
+        sessionId = String(options.cookies[0]);
+        csrfToken = String(options.cookies[1]);
+        dsUserId = options.cookies.length > 2 ? String(options.cookies[2]) : undefined;
+        const parts = [`sessionid=${sessionId}`, `csrftoken=${csrfToken}`];
+        if (dsUserId) parts.push(`ds_user_id=${dsUserId}`);
+        cookieHeader = parts.join('; ');
+      }
+
+      const startTime = Date.now();
+      let lastSync: InstagramSyncProgress = { page: 0, totalFetched: 0, newAdded: 0, running: true, done: false };
+      const spinner = createSpinner(() => {
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        return `Syncing Instagram saved posts...  ${lastSync.newAdded} new  \u2502  page ${lastSync.page}  \u2502  ${elapsed}s`;
+      });
+
+      try {
+        const result = await runWithSpinner(spinner, () => syncInstagramSaved({
+          incremental: !Boolean(options.rebuild),
+          maxPages: Number(options.maxPages) || 200,
+          delayMs: Number(options.delayMs) || 800,
+          maxMinutes: Number(options.maxMinutes) || 30,
+          browser: options.browser ? String(options.browser) : undefined,
+          sessionId,
+          csrfToken,
+          dsUserId,
+          cookieHeader,
+          chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+          chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+          onProgress: (status: InstagramSyncProgress) => {
+            lastSync = status;
+            spinner.update();
+          },
+        }));
+
+        console.log(`\n  \u2713 ${result.added} new posts synced (${result.totalPosts} total)`);
+        console.log(`  ${friendlyStopReason(result.stopReason)}`);
+        console.log(`  \u2713 Data: ${dataDir()}\n`);
+
+        await rebuildIgIndex(result.added);
+
+        if (options.downloadMedia) {
+          const posts = await readJsonLines<InstagramSavedPost>(instagramCachePath());
+          process.stderr.write('  Downloading media...\n');
+          const mediaResult = await downloadInstagramMedia(posts, {
+            onProgress: (p) => {
+              process.stderr.write(`\r  Media: ${p.done}/${p.total} (${p.skipped} skipped, ${p.failed} failed)`);
+            },
+          });
+          process.stderr.write('\n');
+          console.log(`  \u2713 ${mediaResult.downloaded} media files downloaded`);
+          if (mediaResult.failed > 0) console.log(`  ${mediaResult.failed} failed`);
+          console.log(`  \u2713 Media: ${mediaResult.mediaDir}\n`);
+        }
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (msg.includes('cookie') || msg.includes('Cookie') || msg.includes('sessionid') || msg.includes('Keychain')) {
+          console.log(`
+  Couldn't connect to your browser session for Instagram.
+
+  To sync your Instagram saved posts:
+
+    1. Open your browser and log into instagram.com
+    2. Run: ft ig sync
+
+  Options:
+    ft ig sync --browser brave                  Use a specific browser
+    ft ig sync --cookies <sessionid> <csrf> <ds_user_id>   Pass cookies directly
+    ft ig sync --chrome-profile-directory "Profile 1"
+`);
+        } else {
+          console.error(`\n  Error: ${msg}\n`);
+        }
+        process.exitCode = 1;
+      }
+    }));
+
+  // ── ig search ──
+
+  ig
+    .command('search')
+    .description('Full-text search across Instagram saved posts')
+    .argument('<query>', 'Search query')
+    .option('--author <username>', 'Filter by username')
+    .option('--after <date>', 'Posts after this date (YYYY-MM-DD)')
+    .option('--before <date>', 'Posts before this date (YYYY-MM-DD)')
+    .option('--type <type>', 'Filter by media type (image, video, carousel, reel)')
+    .option('--limit <n>', 'Max results', (v: string) => Number(v), 20)
+    .action(safe(async (query: string, options) => {
+      if (!requireIgIndex()) return;
+      const results = await searchInstagramPosts({
+        query,
+        author: options.author ? String(options.author) : undefined,
+        after: options.after ? String(options.after) : undefined,
+        before: options.before ? String(options.before) : undefined,
+        mediaType: options.type ? String(options.type) : undefined,
+        limit: Number(options.limit) || 20,
+      });
+      console.log(formatInstagramSearchResults(results));
+    }));
+
+  // ── ig list ──
+
+  ig
+    .command('list')
+    .description('List Instagram saved posts with filters')
+    .option('--query <query>', 'Text query')
+    .option('--author <username>', 'Filter by username')
+    .option('--after <date>', 'Posted after (YYYY-MM-DD)')
+    .option('--before <date>', 'Posted before (YYYY-MM-DD)')
+    .option('--type <type>', 'Filter by media type')
+    .option('--location <loc>', 'Filter by location name')
+    .option('--reels', 'Show only reels', false)
+    .option('--limit <n>', 'Max results', (v: string) => Number(v), 30)
+    .option('--offset <n>', 'Offset', (v: string) => Number(v), 0)
+    .option('--json', 'JSON output')
+    .action(safe(async (options) => {
+      if (!requireIgIndex()) return;
+      const items = await listInstagramPosts({
+        query: options.query ? String(options.query) : undefined,
+        author: options.author ? String(options.author) : undefined,
+        after: options.after ? String(options.after) : undefined,
+        before: options.before ? String(options.before) : undefined,
+        mediaType: options.type ? String(options.type) : undefined,
+        location: options.location ? String(options.location) : undefined,
+        reelsOnly: Boolean(options.reels),
+        limit: Number(options.limit) || 30,
+        offset: Number(options.offset) || 0,
+      });
+      if (options.json) {
+        console.log(JSON.stringify(items, null, 2));
+        return;
+      }
+      for (const item of items) {
+        const type = item.isReel ? '[reel]' : item.mediaType === 'video' ? '[video]' : item.mediaType === 'carousel' ? '[carousel]' : '[photo]';
+        const caption = item.caption.length > 120 ? `${item.caption.slice(0, 117)}...` : item.caption;
+        const loc = item.location ? `  \u{1F4CD} ${item.location}` : '';
+        const audio = item.audioTitle ? `  \u266A ${item.audioTitle}` : '';
+        console.log(`${item.id}  @${item.authorUsername ?? '?'}  ${item.postedAt?.slice(0, 10) ?? '?'}  ${type}${loc}${audio}`);
+        console.log(`  ${caption}`);
+        console.log(`  ${item.url}`);
+        console.log();
+      }
+    }));
+
+  // ── ig show ──
+
+  ig
+    .command('show')
+    .description('Show one Instagram saved post in detail')
+    .argument('<id>', 'Post ID or shortcode')
+    .option('--json', 'JSON output')
+    .action(safe(async (id: string, options) => {
+      if (!requireIgIndex()) return;
+      const item = await getInstagramPostById(String(id));
+      if (!item) {
+        console.log(`  Post not found: ${String(id)}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (options.json) {
+        console.log(JSON.stringify(item, null, 2));
+        return;
+      }
+      const type = item.isReel ? '[reel]' : `[${item.mediaType}]`;
+      console.log(`${item.id} \u00b7 @${item.authorUsername ?? '?'} ${type}`);
+      console.log(item.url);
+      console.log(item.caption);
+      if (item.location) console.log(`Location: ${item.location}`);
+      if (item.hashtags.length) console.log(`Hashtags: ${item.hashtags.map(h => `#${h}`).join(' ')}`);
+      if (item.mentions.length) console.log(`Mentions: ${item.mentions.map(m => `@${m}`).join(' ')}`);
+      if (item.audioTitle) console.log(`Audio: ${item.audioTitle}${item.audioArtist ? ` by ${item.audioArtist}` : ''}`);
+      const metrics = [
+        item.likeCount != null ? `${item.likeCount} likes` : null,
+        item.commentCount != null ? `${item.commentCount} comments` : null,
+        item.viewCount != null ? `${item.viewCount} views` : null,
+        item.playCount != null ? `${item.playCount} plays` : null,
+      ].filter(Boolean);
+      if (metrics.length) console.log(`Engagement: ${metrics.join(' \u00b7 ')}`);
+    }));
+
+  // ── ig stats ──
+
+  ig
+    .command('stats')
+    .description('Instagram saved posts statistics')
+    .action(safe(async () => {
+      if (!requireIgIndex()) return;
+      const stats = await getInstagramStats();
+      console.log(`Saved posts: ${stats.totalPosts}`);
+      console.log(`  Images: ${stats.totalImages}  Videos: ${stats.totalVideos}  Reels: ${stats.totalReels}  Carousels: ${stats.totalCarousels}`);
+      console.log(`  With video: ${stats.postsWithVideo}  With audio: ${stats.postsWithAudio}`);
+      console.log(`Unique authors: ${stats.uniqueAuthors}`);
+      console.log(`Date range: ${stats.dateRange.earliest?.slice(0, 10) ?? '?'} to ${stats.dateRange.latest?.slice(0, 10) ?? '?'}`);
+      if (stats.topAuthors.length > 0) {
+        console.log(`\nTop authors:`);
+        for (const a of stats.topAuthors) console.log(`  @${a.username}: ${a.count}`);
+      }
+      if (stats.topLocations.length > 0) {
+        console.log(`\nTop locations:`);
+        for (const l of stats.topLocations) console.log(`  ${l.location}: ${l.count}`);
+      }
+    }));
+
+  // ── ig index ──
+
+  ig
+    .command('index')
+    .description('Rebuild the Instagram search index')
+    .option('--force', 'Drop and rebuild from scratch')
+    .action(safe(async (options) => {
+      if (!requireIgData()) return;
+      process.stderr.write('Building Instagram search index...\n');
+      const result = await buildInstagramIndex({ force: Boolean(options.force) });
+      console.log(`Indexed ${result.recordCount} posts (${result.newRecords} new) \u2192 ${result.dbPath}`);
+    }));
+
+  // ── ig download ──
+
+  ig
+    .command('download')
+    .description('Download media (images, videos, audio) for saved posts')
+    .option('--no-video', 'Skip video downloads')
+    .option('--no-audio', 'Skip audio downloads')
+    .option('--no-images', 'Skip image downloads')
+    .option('--delay-ms <n>', 'Delay between downloads in ms', (v: string) => Number(v), 200)
+    .action(safe(async (options) => {
+      if (!requireIgData()) return;
+      const posts = await readJsonLines<InstagramSavedPost>(instagramCachePath());
+      if (posts.length === 0) {
+        console.log('  No posts to download media for.');
+        return;
+      }
+
+      const startTime = Date.now();
+      let lastLine = '';
+      const spinner = createSpinner(() => lastLine);
+
+      const result = await runWithSpinner(spinner, () => downloadInstagramMedia(posts, {
+        downloadVideo: options.video !== false,
+        downloadAudio: options.audio !== false,
+        downloadImages: options.images !== false,
+        delayMs: Number(options.delayMs) || 200,
+        onProgress: (p) => {
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          lastLine = `${p.done}/${p.total} \u2502 ${p.skipped} skipped \u2502 ${p.failed} failed \u2502 ${elapsed}s`;
+          spinner.update();
+        },
+      }));
+
+      console.log(`\n  \u2713 ${result.downloaded} files downloaded (${result.skipped} skipped, ${result.failed} failed)`);
+      console.log(`  \u2713 Total manifest entries: ${result.totalSize}`);
+      console.log(`  \u2713 Media: ${result.mediaDir}\n`);
     }));
 
   // ── hidden backward-compat aliases ────────────────────────────────────

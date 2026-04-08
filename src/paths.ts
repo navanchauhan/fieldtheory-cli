@@ -93,3 +93,29 @@ export function mdEntitiesDir(): string {
 export function mdConceptsDir(): string {
   return path.join(mdDir(), 'concepts');
 }
+
+// ── Instagram paths ─────────────────────────────────────────────────────
+
+export function instagramCachePath(): string {
+  return path.join(dataDir(), 'instagram-saved.jsonl');
+}
+
+export function instagramMetaPath(): string {
+  return path.join(dataDir(), 'instagram-meta.json');
+}
+
+export function instagramSyncStatePath(): string {
+  return path.join(dataDir(), 'instagram-sync-state.json');
+}
+
+export function instagramIndexPath(): string {
+  return path.join(dataDir(), 'instagram.db');
+}
+
+export function instagramMediaDir(): string {
+  return path.join(dataDir(), 'instagram-media');
+}
+
+export function instagramMediaManifestPath(): string {
+  return path.join(dataDir(), 'instagram-media-manifest.json');
+}

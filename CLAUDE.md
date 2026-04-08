@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This is the Field Theory CLI — a standalone tool for syncing and querying X/Twitter bookmarks locally.
+This is the Field Theory CLI — a standalone tool for syncing and querying X/Twitter and Instagram bookmarks locally.
 
 ## Commands
 
@@ -30,15 +30,31 @@ Single CLI application built with Commander.js. All data stored in `~/.ft-bookma
 | `src/chrome-cookies.ts` | Chrome cookie extraction (macOS Keychain) |
 | `src/xauth.ts` | OAuth 2.0 flow |
 | `src/db.ts` | WASM SQLite layer (sql.js-fts5) |
+| `src/instagram-types.ts` | Instagram saved post types |
+| `src/instagram-cookies.ts` | Instagram cookie extraction from Chrome |
+| `src/instagram-api.ts` | Instagram saved posts sync engine |
+| `src/instagram-db.ts` | Instagram SQLite FTS5 index, search, list, stats |
+| `src/instagram-media.ts` | Instagram media downloader (images, video, audio) |
 
 ### Data flow
 
+#### Twitter/X
 ```
 Chrome cookies → GraphQL API → JSONL cache → SQLite FTS5 index
                                     ↓
                            Regex classification
                                     ↓
                          Search / List / Viz
+```
+
+#### Instagram
+```
+Chrome cookies → Instagram API → JSONL cache → SQLite FTS5 index
+                                      ↓
+                              Media download
+                        (images, video, audio)
+                                      ↓
+                         Search / List / Stats
 ```
 
 ### Dependencies
