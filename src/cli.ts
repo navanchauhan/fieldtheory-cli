@@ -22,9 +22,15 @@ import { formatClassificationSummary } from './bookmark-classify.js';
 import { classifyWithLlm, classifyDomainsWithLlm } from './bookmark-classify-llm.js';
 import { resolveEngine, detectAvailableEngines } from './engine.js';
 import { loadPreferences, savePreferences } from './preferences.js';
+import { compileMd } from './md.js';
+import { askMd } from './md-ask.js';
+import { lintMd, fixLintIssues } from './md-lint.js';
+import { exportBookmarks } from './md-export.js';
 import { renderViz } from './bookmarks-viz.js';
 import { listBrowserIds } from './browsers.js';
-import { dataDir, ensureDataDir, isFirstRun, twitterBookmarksIndexPath } from './paths.js';
+import { dataDir, ensureDataDir, isFirstRun, twitterBookmarksIndexPath, mdDir } from './paths.js';
+import { PromptCancelledError, promptText } from './prompt.js';
+import { skillWithFrontmatter, installSkill, uninstallSkill } from './skill.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -325,6 +331,11 @@ function safe(fn: (...args: any[]) => Promise<void>): (...args: any[]) => Promis
     try {
       await fn(...args);
     } catch (err) {
+      if (err instanceof PromptCancelledError) {
+        console.log(`\n  ${err.message}\n`);
+        process.exitCode = err.exitCode;
+        return;
+      }
       const msg = (err as Error).message;
       console.error(`\n  Error: ${msg}\n`);
       process.exitCode = 1;
@@ -478,13 +489,11 @@ export function buildCli() {
 
           // Allow --yes to skip confirmation
           if (!options.yes) {
-            const rl = await import('node:readline');
-            const prompt = rl.createInterface({ input: process.stdin, output: process.stdout });
-            const answer = await new Promise<string>((resolve) => {
-              prompt.question('  Continue? (y/N) ', resolve);
-            });
-            prompt.close();
-            if (answer.trim().toLowerCase() !== 'y') {
+            const answer = await promptText('  Continue? (y/N) ', { output: process.stdout });
+            if (answer.kind === 'interrupt') {
+              throw new PromptCancelledError('Cancelled. Rebuild aborted.', 130);
+            }
+            if (answer.kind !== 'answer' || answer.value.toLowerCase() !== 'y') {
               console.log('  Aborted.');
               return;
             }
@@ -817,17 +826,20 @@ export function buildCli() {
         return;
       }
 
-      const readline = await import('node:readline');
-      const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-      const answer = await new Promise<string>((resolve) => {
-        rl.question('  Select default: ', (a) => { rl.close(); resolve(a.trim().toLowerCase()); });
-      });
+      const answer = await promptText('  Select default: ');
+      if (answer.kind === 'interrupt') {
+        throw new PromptCancelledError('Cancelled. No default model saved.', 130);
+      }
+      if (answer.kind === 'close' || !answer.value) {
+        console.log('  No default model saved.');
+        return;
+      }
 
-      if (available.includes(answer)) {
-        savePreferences({ ...prefs, defaultEngine: answer });
-        console.log(`  \u2713 Default model set to ${answer}`);
-      } else if (answer) {
-        console.log(`  "${answer}" is not available. Found: ${available.join(', ')}`);
+      if (available.includes(answer.value)) {
+        savePreferences({ ...prefs, defaultEngine: answer.value });
+        console.log(`  \u2713 Default model set to ${answer.value}`);
+      } else {
+        console.log(`  "${answer.value}" is not available. Found: ${available.join(', ')}`);
         process.exitCode = 1;
       }
     }));
@@ -949,6 +961,180 @@ export function buildCli() {
         maxBytes: Number(options.maxBytes) || 50 * 1024 * 1024,
       });
       console.log(JSON.stringify(result, null, 2));
+    }));
+
+  // ── ft md ── Export bookmarks as markdown files ────────────────────────
+
+  program
+    .command('md')
+    .description('Export bookmarks as individual markdown files')
+    .option('--force', 'Re-export all bookmarks (overwrite existing files)')
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      let lastLine = '';
+      const spinner = createSpinner(() => lastLine);
+      const result = await exportBookmarks({
+        force: options.force,
+        onProgress: (s) => {
+          lastLine = s;
+          spinner.update();
+        },
+      });
+      spinner.stop();
+      const skippedNote = result.skipped > 0 ? ` (${result.skipped} already existed)` : '';
+      console.log(`Exported ${result.exported}/${result.total} bookmarks${skippedNote}`);
+      console.log(`  ${result.elapsed}s elapsed`);
+      console.log(`\n  Open in your markdown viewer:\n  ${mdDir()}`);
+    }));
+
+  // ── ft wiki ── Compile Karpathy-style knowledge base ────────────────────
+
+  program
+    .command('wiki')
+    .description('Compile Karpathy-style markdown wiki from bookmarks')
+    .option('--full', 'Recompile all pages (ignore incremental cache)')
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      const start = Date.now();
+      let lastLine = '';
+      const spinner = createSpinner(() => lastLine);
+      const result = await compileMd({
+        full: options.full,
+        onProgress: (s) => {
+          lastLine = s;
+          spinner.update();
+        },
+      });
+      spinner.stop();
+      const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+      const failed = result.pagesFailed > 0 ? ` failed=${result.pagesFailed}` : '';
+      console.log(`Done (${elapsed}s) — engine=${result.engine} created=${result.pagesCreated} updated=${result.pagesUpdated} skipped=${result.pagesSkipped}${failed} total=${result.totalPages}`);
+      if (result.pagesFailed > 0) {
+        console.log(`\n  ${result.pagesFailed} page(s) failed — re-run ft wiki to retry them.`);
+      }
+      console.log(`\n  Open in your markdown viewer:\n  ${mdDir()}`);
+    }));
+
+  // ── ft ask ── Q&A against the knowledge base ──────────────────────────
+
+  program
+    .command('ask')
+    .description('Ask a question against the markdown knowledge base')
+    .argument('<question>', 'The question to answer')
+    .option('--save', 'Save the answer as a concept page')
+    .option('--json', 'Output JSON instead of text')
+    .action(safe(async (question, options) => {
+      if (!requireIndex()) return;
+      let lastLine = '';
+      const spinner = createSpinner(() => lastLine);
+      const result = await askMd(question, {
+        save: options.save,
+        onProgress: (s) => {
+          lastLine = s;
+          spinner.update();
+        },
+      });
+      spinner.stop();
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`\n${result.answer}`);
+        if (result.pagesRead.length > 0) {
+          console.log(`\nSources: ${result.pagesRead.join(', ')}`);
+        }
+        if (result.wikiUpdates.length > 0) {
+          console.log('\nSuggested updates:');
+          for (const u of result.wikiUpdates) console.log(`  - ${u}`);
+        }
+        if (result.savedAs) {
+          console.log(`\nSaved to: ${result.savedAs}`);
+        }
+      }
+    }));
+
+  // ── ft lint ── Health-check the markdown wiki ─────────────────────────
+
+  program
+    .command('lint')
+    .description('Health-check the markdown knowledge base')
+    .option('--fix', 'Auto-fix fixable issues with targeted recompile')
+    .option('--json', 'Output JSON instead of text')
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      const result = await lintMd();
+
+      if (options.fix && result.issues.some((i) => i.fixable)) {
+        console.log('Fixing issues...');
+        const fixed = await fixLintIssues(result.issues);
+        console.log(`Fixed ${fixed} pages.`);
+        return;
+      }
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(`Pages: ${result.stats.totalPages}  Links: ${result.stats.totalLinks}  Health: ${result.stats.healthScore}%`);
+      if (result.issues.length === 0) {
+        console.log('No issues found.');
+      } else {
+        for (const issue of result.issues) {
+          const page = issue.page ? ` ${issue.page}` : '';
+          const fix = issue.fixable ? ' (fixable)' : '';
+          console.log(`  [${issue.type}]${page}: ${issue.detail}${fix}`);
+        }
+      }
+    }));
+
+  // ── skill ──────────────────────────────────────────────────────────────
+
+  const skill = program
+    .command('skill')
+    .description('Install the /fieldtheory skill for AI coding agents');
+
+  skill
+    .command('install')
+    .description('Install skill for detected agents (Claude Code, Codex)')
+    .action(safe(async () => {
+      const results = await installSkill();
+      if (results.length === 0) {
+        console.log('  No agents detected. Use `ft skill show` to copy manually.');
+        return;
+      }
+      const labels: Record<string, string> = {
+        installed: 'Installed',
+        updated: 'Updated',
+        'up-to-date': 'Already up to date',
+      };
+      for (const r of results) {
+        console.log(`  ${labels[r.action] ?? r.action} for ${r.agent}: ${r.path}`);
+      }
+      if (results.some((r) => r.action === 'installed' || r.action === 'updated')) {
+        console.log(`\n  Try: /fieldtheory in Claude Code, or ask about your bookmarks in Codex.`);
+      }
+    }));
+
+  skill
+    .command('show')
+    .description('Print skill content to stdout')
+    .action(() => {
+      process.stdout.write(skillWithFrontmatter());
+    });
+
+  skill
+    .command('uninstall')
+    .description('Remove installed skill files')
+    .action(safe(async () => {
+      const results = uninstallSkill();
+      if (results.length === 0) {
+        console.log('  No installed skills found.');
+        return;
+      }
+      for (const r of results) {
+        console.log(`  Removed from ${r.agent}: ${r.path}`);
+      }
     }));
 
   // ── hidden backward-compat aliases ────────────────────────────────────

@@ -695,9 +695,10 @@ export interface CategorySample {
 export async function sampleByCategory(
   category: string,
   limit: number,
+  existingDb?: Database,
 ): Promise<CategorySample[]> {
-  const dbPath = twitterBookmarksIndexPath();
-  const db = await openDb(dbPath);
+  const db = existingDb ?? await openDb(twitterBookmarksIndexPath());
+  if (!existingDb) ensureMigrations(db);
   try {
     const rows = db.exec(
       `SELECT id, url, text, author_handle, categories, github_urls, links_json
@@ -708,7 +709,7 @@ export async function sampleByCategory(
       [`%${category}%`, limit]
     );
     if (!rows.length) return [];
-    return rows[0].values.map((r) => ({
+    return rows[0].values.map((r: any) => ({
       id: r[0] as string,
       url: r[1] as string,
       text: r[2] as string,
@@ -718,14 +719,13 @@ export async function sampleByCategory(
       links: (r[6] as string) ?? undefined,
     }));
   } finally {
-    db.close();
+    if (!existingDb) db.close();
   }
 }
 
-export async function getCategoryCounts(): Promise<Record<string, number>> {
-  const dbPath = twitterBookmarksIndexPath();
-  const db = await openDb(dbPath);
-  ensureMigrations(db);
+export async function getCategoryCounts(existingDb?: Database): Promise<Record<string, number>> {
+  const db = existingDb ?? await openDb(twitterBookmarksIndexPath());
+  if (!existingDb) ensureMigrations(db);
   try {
     const rows = db.exec(
       `SELECT primary_category, COUNT(*) as c FROM bookmarks
@@ -738,14 +738,13 @@ export async function getCategoryCounts(): Promise<Record<string, number>> {
     }
     return counts;
   } finally {
-    db.close();
+    if (!existingDb) db.close();
   }
 }
 
-export async function getDomainCounts(): Promise<Record<string, number>> {
-  const dbPath = twitterBookmarksIndexPath();
-  const db = await openDb(dbPath);
-  ensureMigrations(db);
+export async function getDomainCounts(existingDb?: Database): Promise<Record<string, number>> {
+  const db = existingDb ?? await openDb(twitterBookmarksIndexPath());
+  if (!existingDb) ensureMigrations(db);
   try {
     const rows = db.exec(
       `SELECT primary_domain, COUNT(*) as c FROM bookmarks
@@ -758,17 +757,17 @@ export async function getDomainCounts(): Promise<Record<string, number>> {
     }
     return counts;
   } finally {
-    db.close();
+    if (!existingDb) db.close();
   }
 }
 
 export async function sampleByDomain(
   domain: string,
   limit: number,
+  existingDb?: Database,
 ): Promise<CategorySample[]> {
-  const dbPath = twitterBookmarksIndexPath();
-  const db = await openDb(dbPath);
-  ensureMigrations(db);
+  const db = existingDb ?? await openDb(twitterBookmarksIndexPath());
+  if (!existingDb) ensureMigrations(db);
   try {
     const rows = db.exec(
       `SELECT id, url, text, author_handle, categories, github_urls, links_json
@@ -779,7 +778,7 @@ export async function sampleByDomain(
       [`%${domain}%`, limit]
     );
     if (!rows.length) return [];
-    return rows[0].values.map((r) => ({
+    return rows[0].values.map((r: any) => ({
       id: r[0] as string,
       url: r[1] as string,
       text: r[2] as string,
@@ -789,9 +788,76 @@ export async function sampleByDomain(
       links: (r[6] as string) ?? undefined,
     }));
   } finally {
-    db.close();
+    if (!existingDb) db.close();
   }
 }
+
+export async function sampleByAuthor(
+  authorHandle: string,
+  limit: number,
+  existingDb?: Database,
+): Promise<CategorySample[]> {
+  const db = existingDb ?? await openDb(twitterBookmarksIndexPath());
+  if (!existingDb) ensureMigrations(db);
+  try {
+    const rows = db.exec(
+      `SELECT id, url, text, author_handle, categories, github_urls, links_json
+       FROM bookmarks
+       WHERE author_handle = ? COLLATE NOCASE
+       ORDER BY COALESCE(posted_at, bookmarked_at) DESC
+       LIMIT ?`,
+      [authorHandle, limit]
+    );
+    if (!rows.length) return [];
+    return rows[0].values.map((r: any) => ({
+      id: r[0] as string,
+      url: r[1] as string,
+      text: r[2] as string,
+      authorHandle: (r[3] as string) ?? undefined,
+      categories: (r[4] as string) ?? '',
+      githubUrls: (r[5] as string) ?? undefined,
+      links: (r[6] as string) ?? undefined,
+    }));
+  } finally {
+    if (!existingDb) db.close();
+  }
+}
+
+export async function getTopAuthorHandles(
+  minCount: number,
+  existingDb?: Database,
+): Promise<{ handle: string; count: number }[]> {
+  const db = existingDb ?? await openDb(twitterBookmarksIndexPath());
+  if (!existingDb) ensureMigrations(db);
+  try {
+    const rows = db.exec(
+      `SELECT author_handle, COUNT(*) as c FROM bookmarks
+       WHERE author_handle IS NOT NULL
+       GROUP BY author_handle
+       HAVING c >= ?
+       ORDER BY c DESC`,
+      [minCount]
+    );
+    return (rows[0]?.values ?? []).map((r: any) => ({
+      handle: r[0] as string,
+      count: r[1] as number,
+    }));
+  } finally {
+    if (!existingDb) db.close();
+  }
+}
+
+/**
+ * Open the bookmarks DB with migrations applied. Caller is responsible for
+ * closing the handle.
+ */
+export async function openBookmarksDb(): Promise<Database> {
+  const db = await openDb(twitterBookmarksIndexPath());
+  ensureMigrations(db);
+  return db;
+}
+
+export { type Database } from 'sql.js';
 
 // ── Gap-fill helpers ────────────────────────────────────────────────────
 

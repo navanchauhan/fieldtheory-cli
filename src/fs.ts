@@ -1,4 +1,5 @@
-import { access, mkdir, readFile, readdir, writeFile, rename } from 'node:fs/promises';
+import { access, appendFile, mkdir, readFile, readdir, writeFile, rename } from 'node:fs/promises';
+import path from 'node:path';
 
 interface WriteOptions {
   mode?: number;
@@ -54,4 +55,21 @@ export async function readJsonLines<T>(filePath: string): Promise<T[]> {
   } catch {
     return [];
   }
+}
+
+// ── Markdown helpers ─────────────────────────────────────────────────────
+
+export async function writeMd(filePath: string, content: string): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, content, 'utf8');
+}
+
+export async function readMd(filePath: string): Promise<string> {
+  return readFile(filePath, 'utf8');
+}
+
+export async function appendLine(filePath: string, line: string): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const nl = line.endsWith('\n') ? line : line + '\n';
+  await appendFile(filePath, nl, 'utf8');
 }
