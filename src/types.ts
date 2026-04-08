@@ -12,6 +12,7 @@ export interface BookmarkMediaObject {
   width?: number;
   height?: number;
   variants?: BookmarkMediaVariant[];
+  videoVariants?: BookmarkMediaVariant[];
 }
 
 export interface BookmarkAuthorSnapshot {
